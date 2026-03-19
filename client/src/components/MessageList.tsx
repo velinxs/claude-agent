@@ -8,13 +8,12 @@ interface Props {
 }
 
 interface DisplayMessage {
-  type: "user" | "assistant" | "error" | "tool" | "login_link";
+  type: "user" | "assistant" | "error" | "tool";
   content: string;
   toolName?: string;
   toolInput?: unknown;
   toolOutput?: string;
   toolRunning?: boolean;
-  url?: string;
 }
 
 export function MessageList({ messages, userMessages }: Props) {
@@ -74,10 +73,6 @@ export function MessageList({ messages, userMessages }: Props) {
         result.push({ type: "error", content: msg.message });
       }
 
-      if (msg.type === "login_url") {
-        result.push({ type: "login_link", content: msg.url, url: msg.url });
-      }
-
       if (msg.type === "done") {
         currentText = "";
       }
@@ -116,16 +111,6 @@ export function MessageList({ messages, userMessages }: Props) {
               output={msg.toolOutput}
               running={msg.toolRunning!}
             />
-          );
-        }
-        if (msg.type === "login_link") {
-          return (
-            <div key={i} class="msg msg-login-link">
-              Open to authenticate:{" "}
-              <a href={msg.url} target="_blank" rel="noopener">
-                {msg.url!.length > 80 ? msg.url!.slice(0, 80) + "..." : msg.url}
-              </a>
-            </div>
           );
         }
         return null;

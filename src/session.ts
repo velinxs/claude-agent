@@ -43,6 +43,16 @@ export class AgentSession extends DurableObject<Env> {
       return;
     }
 
+    if (msg.type === "terminal_input") {
+      await this.sendTerminalInput(msg.data);
+      return;
+    }
+
+    if (msg.type === "terminal_close") {
+      await this.closeTerminal();
+      return;
+    }
+
     if (msg.type === "message") {
       this.interrupted = false;
       await this.runAgent(ws, msg.content, msg.token, msg.model ?? "claude-sonnet-4-6");
@@ -157,181 +167,121 @@ export class AgentSession extends DurableObject<Env> {
     this.send(ws, { type: "done" });
   }
 
+  private terminalTimeout: ReturnType<typeof setTimeout> | null = null;
+
   private async runLogin(ws: WebSocket) {
     this.loginInProgress = true;
     const sandboxId = this.ctx.id.toString().slice(0, 63);
     const sandbox = getSandbox(this.env.Sandbox, sandboxId);
+    const env = { HOME: "/home/agent", CLAUDE_NO_AUTO_UPDATE: "1" };
+
+    // 3-minute safety timeout
+    this.terminalTimeout = setTimeout(() => this.closeTerminal(), 180000);
 
     try {
-      this.send(ws, { type: "text", content: "Starting Claude login...\n" });
-
-      // First, discover available CLI subcommands
-      const helpResult = await sandbox.exec("claude --help 2>&1", {
-        timeout: 15000,
-        env: { HOME: "/home/agent", CLAUDE_NO_AUTO_UPDATE: "1", CI: "1" },
-      });
-      const helpOutput = (helpResult.stdout ?? "") + (helpResult.stderr ?? "");
-      console.log("[login] claude --help output:", helpOutput.slice(0, 1000));
-      this.send(ws, { type: "text", content: "CLI help:\n" + helpOutput + "\n\n" });
-
-      // Try multiple login approaches
-      // 1. `echo "/login" | claude` — pipe /login into interactive REPL
-      // 2. `claude auth login` — if auth subcommand exists
-      let tunnelUrl: string | null = null;
-      let localhostPort: string | null = null;
-
-      const loginCmd = helpOutput.includes("auth")
-        ? "claude auth login 2>&1"
-        : "sh -c 'printf \"/login\\n\" | BROWSER=echo claude 2>&1'";
-
-      this.send(ws, { type: "text", content: "Running: " + loginCmd + "\n" });
-
-      const result = await sandbox.exec(
-        loginCmd,
-        {
-          stream: true,
-          timeout: 120000,
-          env: {
-            HOME: "/home/agent",
-            CLAUDE_NO_AUTO_UPDATE: "1",
-            DISPLAY: "",
-            BROWSER: "echo",
-          },
-          onOutput: (stream: string, data: string) => {
-            console.log(`[login ${stream}]`, data.slice(0, 500));
-
-            // Look for URLs in the output
-            const urlMatches = data.match(/https?:\/\/[^\s"'<>]+/g);
-            if (urlMatches) {
-              for (const url of urlMatches) {
-                console.log("[login url found]", url);
-
-                // Check if this is a localhost redirect URL embedded in the auth URL
-                // e.g., ...redirect_uri=http%3A%2F%2Flocalhost%3A9876%2F...
-                const localhostMatch = url.match(/localhost[:%]3A?(\d+)/i)
-                  || data.match(/localhost:(\d+)/);
-                if (localhostMatch && !localhostPort) {
-                  localhostPort = localhostMatch[1];
-                  console.log("[login] detected localhost callback port:", localhostPort);
-                  // Start a cloudflared tunnel for the callback port
-                  // We'll do this asynchronously — the tunnel needs to be up before user completes auth
-                  this.startCallbackTunnel(sandbox, localhostPort, ws).then(tUrl => {
-                    if (tUrl) {
-                      tunnelUrl = tUrl;
-                      // Rewrite the auth URL to use the tunnel instead of localhost
-                      const rewritten = url.replace(
-                        /http(s?):\/\/localhost(:\d+|%3A\d+)/gi,
-                        tunnelUrl
-                      );
-                      console.log("[login] rewritten auth URL:", rewritten.slice(0, 100));
-                      this.send(ws, { type: "login_url", url: rewritten });
-                      this.send(ws, { type: "text", content: "\nAuth URL ready — check the popup or click the link above.\n" });
-                    }
-                  });
-                }
-
-                // If it's a direct auth URL (no localhost redirect, e.g. device code flow)
-                if ((url.includes("anthropic") || url.includes("claude") || url.includes("oauth"))
-                    && !url.includes("localhost")) {
-                  this.send(ws, { type: "login_url", url });
-                  this.send(ws, { type: "text", content: "\nAuth URL ready — check the popup or click the link above.\n" });
-                }
-              }
-            }
-
-            // Forward other output as text
-            if (!urlMatches) {
-              this.send(ws, { type: "text", content: data });
-            }
-          },
-        }
+      // Create FIFO for stdin + keep-alive writer so it doesn't block
+      await sandbox.exec(
+        "rm -f /tmp/term_in; mkfifo /tmp/term_in; sleep 300 > /tmp/term_in &",
+        { timeout: 5000, env }
       );
 
-      console.log("[login result]", JSON.stringify({ exitCode: result.exitCode, success: result.success }));
+      // Run `claude login` via script(1) for pty, streaming output directly.
+      // Buffer output for 50ms to avoid splitting ANSI escape sequences
+      // across multiple WebSocket messages (causes screen tearing in xterm.js).
+      let outputBuffer = "";
+      let flushTimer: ReturnType<typeof setTimeout> | null = null;
+      const flushOutput = () => {
+        if (outputBuffer && this.loginInProgress) {
+          this.send(ws, { type: "terminal_output", data: outputBuffer });
+          outputBuffer = "";
+        }
+        flushTimer = null;
+      };
 
-      // Kill the tunnel if we started one
-      if (localhostPort) {
-        await sandbox.exec("pkill -f cloudflared || true", {
-          timeout: 5000,
-          env: { HOME: "/home/agent" },
-        }).catch(() => {});
-      }
+      sandbox.exec(
+        "script -qfc 'claude login' /dev/null < /tmp/term_in",
+        {
+          stream: true,
+          timeout: 180000,
+          env: { ...env, BROWSER: "echo", TERM: "xterm-256color" },
+          onOutput: (_stream: string, data: string) => {
+            if (!this.loginInProgress) return;
+            outputBuffer += data;
+            if (!flushTimer) flushTimer = setTimeout(flushOutput, 50);
+          },
+        }
+      ).then(async (result) => {
+        // Process exited — verify auth
+        console.log("[login] exited:", result.exitCode);
+        if (!this.loginInProgress) return;
+        await this.verifyAndFinishLogin(ws, sandbox, env);
+      }).catch((err) => {
+        console.error("[login exec error]", err);
+        if (this.loginInProgress) {
+          this.send(ws, { type: "error", message: `Login error: ${String(err)}` });
+          this.closeTerminal();
+        }
+      });
 
-      if (result.success) {
-        this.authenticated = true;
-        this.send(ws, { type: "login_success" });
-        this.send(ws, { type: "text", content: "\nAuthenticated! You can now send messages.\n" });
-      } else {
-        this.send(ws, { type: "error", message: `Login exited with code ${result.exitCode}. You can still paste a token manually.` });
-      }
     } catch (err) {
       console.error("[login error]", err);
       this.send(ws, { type: "error", message: `Login error: ${String(err)}` });
+      this.send(ws, { type: "done" });
+      this.loginInProgress = false;
     }
-
-    this.loginInProgress = false;
-    this.send(ws, { type: "done" });
   }
 
-  private async startCallbackTunnel(
-    sandbox: ReturnType<typeof getSandbox>,
-    port: string,
-    ws: WebSocket
-  ): Promise<string | null> {
-    // Start cloudflared tunnel for the OAuth callback port
-    // The tunnel output contains the public URL
-    this.send(ws, { type: "text", content: `Setting up auth tunnel on port ${port}...\n` });
+  private async sendTerminalInput(data: string) {
+    const sandboxId = this.ctx.id.toString().slice(0, 63);
+    const sandbox = getSandbox(this.env.Sandbox, sandboxId);
+    const env = { HOME: "/home/agent", CLAUDE_NO_AUTO_UPDATE: "1" };
 
     try {
-      const tunnelResult = await sandbox.exec(
-        `sh -c 'cloudflared tunnel --url http://localhost:${port} --no-autoupdate 2>&1 & sleep 5 && grep -o "https://[^ ]*\\.trycloudflare\\.com" /proc/$(pgrep -f cloudflared | head -1)/fd/2 2>/dev/null || curl -s http://localhost:${port} > /dev/null && echo "tunnel_ready"'`,
-        {
-          stream: true,
-          timeout: 30000,
-          env: { HOME: "/home/agent" },
-          onOutput: (stream: string, data: string) => {
-            console.log(`[tunnel ${stream}]`, data.slice(0, 300));
-            const match = data.match(/https:\/\/[^\s]*\.trycloudflare\.com/);
-            if (match) {
-              console.log("[tunnel] got URL:", match[0]);
-            }
-          },
-        }
-      );
+      // Write raw keystrokes to the FIFO → script(1) → claude login stdin
+      await sandbox.writeFile("/tmp/term_key", data);
+      await sandbox.exec("cat /tmp/term_key > /tmp/term_in", { timeout: 5000, env });
+    } catch (err) {
+      console.error("[terminal input error]", err);
+    }
+  }
 
-      // Parse the tunnel URL from output
-      const stdout = tunnelResult.stdout ?? "";
-      const stderr = tunnelResult.stderr ?? "";
-      const combined = stdout + stderr;
-      const match = combined.match(/https:\/\/[^\s]*\.trycloudflare\.com/);
-      if (match) {
-        return match[0];
+  private async verifyAndFinishLogin(ws: WebSocket, sandbox: ReturnType<typeof getSandbox>, env: Record<string, string>) {
+    try {
+      const result = await sandbox.exec(
+        "sh -c 'echo hi | timeout 15 claude -p --output-format text 2>&1 | head -3'",
+        { timeout: 20000, env: { ...env, CI: "1" } }
+      );
+      const out = (result.stdout ?? "") + (result.stderr ?? "");
+      console.log("[login verify]", out.slice(0, 200));
+
+      if (result.success && !out.includes("Not logged in") && !out.includes("/login")) {
+        this.authenticated = true;
+        this.send(ws, { type: "login_success" });
       }
-    } catch (err) {
-      console.error("[tunnel error]", err);
-    }
+    } catch {}
 
-    // Fallback: start tunnel in background and poll for URL
-    try {
-      await sandbox.exec(
-        `sh -c 'nohup cloudflared tunnel --url http://localhost:${port} --no-autoupdate > /tmp/tunnel.log 2>&1 &'`,
-        { timeout: 5000, env: { HOME: "/home/agent" } }
-      );
-      // Wait a bit then check the log
-      await new Promise(r => setTimeout(r, 4000));
-      const logResult = await sandbox.exec("cat /tmp/tunnel.log", {
-        timeout: 5000,
-        env: { HOME: "/home/agent" },
-      });
-      const logOutput = logResult.stdout ?? "";
-      const match = logOutput.match(/https:\/\/[^\s]*\.trycloudflare\.com/);
-      if (match) return match[0];
-    } catch (err) {
-      console.error("[tunnel fallback error]", err);
-    }
+    this.send(ws, { type: "terminal_exit", code: 0 });
+    this.closeTerminal();
+  }
 
-    this.send(ws, { type: "text", content: "Could not set up tunnel for OAuth callback. Try pasting a token instead.\n" });
-    return null;
+  private async closeTerminal() {
+    if (this.terminalTimeout) {
+      clearTimeout(this.terminalTimeout);
+      this.terminalTimeout = null;
+    }
+    this.loginInProgress = false;
+
+    const sandboxId = this.ctx.id.toString().slice(0, 63);
+    const sandbox = getSandbox(this.env.Sandbox, sandboxId);
+    const env = { HOME: "/home/agent", CLAUDE_NO_AUTO_UPDATE: "1" };
+    await sandbox.exec(
+      "pkill -f 'claude login' 2>/dev/null; pkill -f 'sleep 300' 2>/dev/null; rm -f /tmp/term_in /tmp/term_key",
+      { timeout: 5000, env }
+    ).catch(() => {});
+
+    for (const ws of this.ctx.getWebSockets()) {
+      this.send(ws, { type: "done" });
+    }
   }
 
   private async hashToken(token: string): Promise<string> {
