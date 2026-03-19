@@ -2,7 +2,7 @@ import type { Sandbox } from "@cloudflare/sandbox";
 
 // Messages from client → server (WebSocket for CF Sandbox mode)
 export type ClientMessage =
-  | { type: "message"; content: string; token?: string; model?: string }
+  | { type: "message"; content: string; token?: string; model?: string; runtime?: string }
   | { type: "interrupt" }
   | { type: "reset" }
   | { type: "login" }

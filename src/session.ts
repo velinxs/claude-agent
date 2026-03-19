@@ -5,8 +5,6 @@ import type { Env, ServerMessage, ClientMessage } from "./types";
 export class AgentSession extends DurableObject<Env> {
   private interrupted = false;
   private mounted = false;
-  private authenticated = false;
-  private loginInProgress = false;
 
   async fetch(request: Request): Promise<Response> {
     const upgradeHeader = request.headers.get("Upgrade");
@@ -28,34 +26,16 @@ export class AgentSession extends DurableObject<Env> {
       return;
     }
 
-    if (msg.type === "ping") {
-      return;
-    }
+    if (msg.type === "ping") return;
 
     if (msg.type === "interrupt") {
       this.interrupted = true;
       return;
     }
 
-    if (msg.type === "login") {
-      if (this.loginInProgress) return;
-      await this.runLogin(ws);
-      return;
-    }
-
-    if (msg.type === "terminal_input") {
-      await this.sendTerminalInput(msg.data);
-      return;
-    }
-
-    if (msg.type === "terminal_close") {
-      await this.closeTerminal();
-      return;
-    }
-
     if (msg.type === "message") {
       this.interrupted = false;
-      await this.runAgent(ws, msg.content, msg.token, msg.model ?? "claude-sonnet-4-6");
+      await this.runAgent(ws, msg.content, msg.token, msg.model ?? "claude-sonnet-4-6", msg.runtime ?? "claude");
     }
   }
 
@@ -66,33 +46,154 @@ export class AgentSession extends DurableObject<Env> {
     ws.send(JSON.stringify(msg));
   }
 
-  private async runAgent(ws: WebSocket, userMessage: string, token: string | undefined, model: string) {
-    // One persistent container per session — filesystem survives across turns
+  private async mountStorage(sandbox: ReturnType<typeof getSandbox>, token?: string) {
+    if (this.mounted || !this.env.R2_ENDPOINT) return;
+    try {
+      const prefix = token
+        ? `users/${await this.hashToken(token)}/`
+        : `sessions/${this.ctx.id.toString().slice(0, 32)}/`;
+      await sandbox.mountBucket("agent-storage", "/home/agent/persistent", {
+        endpoint: this.env.R2_ENDPOINT,
+        prefix,
+      });
+      this.mounted = true;
+      console.log("[r2] mounted with prefix", prefix.slice(0, 30));
+    } catch (err) {
+      console.error("[r2 mount error]", err);
+    }
+  }
+
+  private async runAgent(ws: WebSocket, userMessage: string, token: string | undefined, model: string, runtime: string) {
     const sandboxId = this.ctx.id.toString().slice(0, 63);
     const sandbox = getSandbox(this.env.Sandbox, sandboxId);
 
-    // Mount persistent R2 storage scoped to user (derived from token hash or session ID)
-    if (!this.mounted && this.env.R2_ENDPOINT) {
-      try {
-        // Use token hash if available, otherwise use session-based prefix
-        const prefix = token
-          ? `users/${await this.hashToken(token)}/`
-          : `sessions/${this.ctx.id.toString().slice(0, 32)}/`;
-        await sandbox.mountBucket("agent-storage", "/home/agent/persistent", {
-          endpoint: this.env.R2_ENDPOINT,
-          prefix,
-        });
-        this.mounted = true;
-        console.log("[r2] mounted persistent storage with prefix", prefix.slice(0, 30));
-      } catch (err) {
-        console.error("[r2 mount error]", err);
-      }
+    // Mount R2 FUSE storage for persistence across sessions
+    await this.mountStorage(sandbox, token);
+
+    if (runtime === "ironclaw") {
+      await this.runIronClaw(ws, sandbox, userMessage, token, model);
+    } else {
+      await this.runClaudeCLI(ws, sandbox, userMessage, token, model);
     }
 
-    // Resume existing conversation if we have a session ID
-    const savedSessionId = await this.ctx.storage.get<string>("sessionId");
+    this.send(ws, { type: "done" });
+  }
 
-    // Write message to temp file — avoids shell escaping issues
+  // --- IronClaw runtime (model-agnostic) ---
+  private async runIronClaw(
+    ws: WebSocket,
+    sandbox: ReturnType<typeof getSandbox>,
+    userMessage: string,
+    token: string | undefined,
+    model: string
+  ) {
+    const msgFile = `/tmp/msg_${Date.now()}.txt`;
+    await sandbox.writeFile(msgFile, userMessage);
+
+    // Map model names to IronClaw LLM backend + model
+    const { backend, modelName } = this.mapModel(model);
+
+    const env: Record<string, string> = {
+      HOME: "/home/agent",
+      IRONCLAW_DATA_DIR: "/home/agent/persistent",
+      LLM_BACKEND: backend,
+      LLM_MODEL: modelName,
+      SANDBOX_ENABLED: "true",
+      NEAR_ENABLED: "false",
+    };
+
+    // Set API key based on backend
+    if (token) {
+      if (backend === "anthropic") env.ANTHROPIC_API_KEY = token;
+      else if (backend === "openai") env.OPENAI_API_KEY = token;
+      else if (backend === "openai_compatible") env.OPENAI_API_KEY = token;
+      else env.LLM_API_KEY = token;
+    }
+
+    // Note: user message is written to a file and read via cat to avoid
+    // shell injection. The sandbox.writeFile + cat pattern is safe.
+    const command = `sh -c 'ironclaw chat --message "$(cat ${msgFile})" --output json 2>&1'`;
+
+    try {
+      let outputBuffer = "";
+      const result = await sandbox.exec(command, {
+        stream: true,
+        timeout: 120000,
+        env,
+        onOutput: (_stream: string, data: string) => {
+          if (this.interrupted) return;
+          outputBuffer += data;
+
+          const lines = outputBuffer.split("\n");
+          outputBuffer = lines.pop() ?? "";
+          for (const line of lines) {
+            if (!line.trim()) continue;
+            try {
+              const event = JSON.parse(line);
+              this.handleIronClawEvent(ws, event);
+            } catch {
+              this.send(ws, { type: "text", content: line + "\n" });
+            }
+          }
+        },
+      });
+
+      if (outputBuffer.trim()) {
+        try {
+          this.handleIronClawEvent(ws, JSON.parse(outputBuffer));
+        } catch {
+          if (outputBuffer.trim()) this.send(ws, { type: "text", content: outputBuffer });
+        }
+      }
+
+      if (!result.success) {
+        this.send(ws, { type: "error", message: `ironclaw exited with code ${result.exitCode}` });
+      }
+    } catch (err) {
+      this.send(ws, { type: "error", message: String(err) });
+    }
+  }
+
+  private handleIronClawEvent(ws: WebSocket, event: Record<string, unknown>) {
+    if (event.type === "text" || event.type === "response") {
+      this.send(ws, { type: "text", content: (event.content ?? event.text ?? "") as string });
+    }
+    if (event.type === "tool_call" || event.type === "tool_use") {
+      this.send(ws, { type: "tool_start", name: (event.name ?? event.tool) as string, input: event.input ?? event.args });
+    }
+    if (event.type === "tool_result") {
+      this.send(ws, { type: "tool_output", name: (event.name ?? "result") as string, output: String(event.output ?? event.result ?? "") });
+    }
+    if (event.type === "delta" || event.type === "chunk") {
+      this.send(ws, { type: "text", content: (event.content ?? event.text ?? "") as string });
+    }
+  }
+
+  private mapModel(model: string): { backend: string; modelName: string } {
+    if (model.includes("claude") || model.includes("sonnet") || model.includes("opus") || model.includes("haiku")) {
+      return { backend: "anthropic", modelName: model };
+    }
+    if (model.includes("gpt") || model.includes("o1") || model.includes("o3")) {
+      return { backend: "openai", modelName: model };
+    }
+    if (model.includes("gemini")) {
+      return { backend: "openai_compatible", modelName: model };
+    }
+    if (model.includes("llama") || model.includes("mistral") || model.includes("codellama")) {
+      return { backend: "ollama", modelName: model };
+    }
+    return { backend: "openai_compatible", modelName: model };
+  }
+
+  // --- Claude CLI runtime (direct mode) ---
+  private async runClaudeCLI(
+    ws: WebSocket,
+    sandbox: ReturnType<typeof getSandbox>,
+    userMessage: string,
+    token: string | undefined,
+    model: string
+  ) {
+    const savedSessionId = await this.ctx.storage.get<string>("sessionId");
     const msgFile = `/tmp/msg_${Date.now()}.txt`;
     await sandbox.writeFile(msgFile, userMessage);
 
@@ -108,210 +209,60 @@ export class AgentSession extends DurableObject<Env> {
       savedSessionId ? `--resume ${savedSessionId}` : "",
     ].filter(Boolean).join(" ");
 
-    // Use sh -c to get stdin redirection from the temp file
+    // Message is read from a file via stdin redirect to avoid shell injection
     const command = `sh -c '${claudeCmd} < ${msgFile}'`;
-
     let lineBuffer = "";
 
-    // Build env — include token if provided, otherwise rely on sandbox-stored OAuth creds
-    const execEnv: Record<string, string> = {
+    const env: Record<string, string> = {
       CLAUDE_NO_AUTO_UPDATE: "1",
       CI: "1",
       HOME: "/home/agent",
     };
-    if (token) {
-      execEnv.CLAUDE_CODE_OAUTH_TOKEN = token;
-    }
+    if (token) env.CLAUDE_CODE_OAUTH_TOKEN = token;
 
     try {
       const result = await sandbox.exec(command, {
         stream: true,
         timeout: 120000,
-        env: execEnv,
-        onOutput: (stream: string, data: string) => {
+        env,
+        onOutput: (_stream: string, data: string) => {
           if (this.interrupted) return;
-          console.log(`[sandbox ${stream}]`, data.slice(0, 200));
-
-          // Buffer and parse complete NDJSON lines
           lineBuffer += data;
           const lines = lineBuffer.split("\n");
           lineBuffer = lines.pop() ?? "";
-
           for (const line of lines) {
             if (!line.trim()) continue;
             try {
-              this.handleEvent(ws, JSON.parse(line));
+              this.handleClaudeEvent(ws, JSON.parse(line));
             } catch {
-              // non-JSON output (e.g. debug logs) — forward as text for debugging
               console.log("[non-json]", line.slice(0, 200));
             }
           }
         },
       });
 
-      console.log("[exec result]", JSON.stringify({ exitCode: result.exitCode, success: result.success }));
-
-      // Flush any remaining buffered line
       if (lineBuffer.trim()) {
-        try { this.handleEvent(ws, JSON.parse(lineBuffer)); } catch {}
+        try { this.handleClaudeEvent(ws, JSON.parse(lineBuffer)); } catch {}
       }
-
       if (!result.success) {
         this.send(ws, { type: "error", message: `claude exited with code ${result.exitCode}` });
       }
     } catch (err) {
-      console.error("[exec error]", err);
       this.send(ws, { type: "error", message: String(err) });
     }
-
-    this.send(ws, { type: "done" });
   }
 
-  private terminalTimeout: ReturnType<typeof setTimeout> | null = null;
-
-  private async runLogin(ws: WebSocket) {
-    this.loginInProgress = true;
-    const sandboxId = this.ctx.id.toString().slice(0, 63);
-    const sandbox = getSandbox(this.env.Sandbox, sandboxId);
-    const env = { HOME: "/home/agent", CLAUDE_NO_AUTO_UPDATE: "1" };
-
-    // 3-minute safety timeout
-    this.terminalTimeout = setTimeout(() => this.closeTerminal(), 180000);
-
-    try {
-      // Create FIFO for stdin + keep-alive writer so it doesn't block
-      await sandbox.exec(
-        "rm -f /tmp/term_in; mkfifo /tmp/term_in; sleep 300 > /tmp/term_in &",
-        { timeout: 5000, env }
-      );
-
-      // Run `claude login` via script(1) for pty, streaming output directly.
-      // Buffer output for 50ms to avoid splitting ANSI escape sequences
-      // across multiple WebSocket messages (causes screen tearing in xterm.js).
-      let outputBuffer = "";
-      let flushTimer: ReturnType<typeof setTimeout> | null = null;
-      const flushOutput = () => {
-        if (outputBuffer && this.loginInProgress) {
-          this.send(ws, { type: "terminal_output", data: outputBuffer });
-          outputBuffer = "";
-        }
-        flushTimer = null;
-      };
-
-      sandbox.exec(
-        "script -qfc 'claude login' /dev/null < /tmp/term_in",
-        {
-          stream: true,
-          timeout: 180000,
-          env: { ...env, BROWSER: "echo", TERM: "xterm-256color" },
-          onOutput: (_stream: string, data: string) => {
-            if (!this.loginInProgress) return;
-            outputBuffer += data;
-            if (!flushTimer) flushTimer = setTimeout(flushOutput, 50);
-          },
-        }
-      ).then(async (result) => {
-        // Process exited — verify auth
-        console.log("[login] exited:", result.exitCode);
-        if (!this.loginInProgress) return;
-        await this.verifyAndFinishLogin(ws, sandbox, env);
-      }).catch((err) => {
-        console.error("[login exec error]", err);
-        if (this.loginInProgress) {
-          this.send(ws, { type: "error", message: `Login error: ${String(err)}` });
-          this.closeTerminal();
-        }
-      });
-
-    } catch (err) {
-      console.error("[login error]", err);
-      this.send(ws, { type: "error", message: `Login error: ${String(err)}` });
-      this.send(ws, { type: "done" });
-      this.loginInProgress = false;
-    }
-  }
-
-  private async sendTerminalInput(data: string) {
-    const sandboxId = this.ctx.id.toString().slice(0, 63);
-    const sandbox = getSandbox(this.env.Sandbox, sandboxId);
-    const env = { HOME: "/home/agent", CLAUDE_NO_AUTO_UPDATE: "1" };
-
-    try {
-      // Write raw keystrokes to the FIFO → script(1) → claude login stdin
-      await sandbox.writeFile("/tmp/term_key", data);
-      await sandbox.exec("cat /tmp/term_key > /tmp/term_in", { timeout: 5000, env });
-    } catch (err) {
-      console.error("[terminal input error]", err);
-    }
-  }
-
-  private async verifyAndFinishLogin(ws: WebSocket, sandbox: ReturnType<typeof getSandbox>, env: Record<string, string>) {
-    try {
-      const result = await sandbox.exec(
-        "sh -c 'echo hi | timeout 15 claude -p --output-format text 2>&1 | head -3'",
-        { timeout: 20000, env: { ...env, CI: "1" } }
-      );
-      const out = (result.stdout ?? "") + (result.stderr ?? "");
-      console.log("[login verify]", out.slice(0, 200));
-
-      if (result.success && !out.includes("Not logged in") && !out.includes("/login")) {
-        this.authenticated = true;
-        this.send(ws, { type: "login_success" });
-      }
-    } catch {}
-
-    this.send(ws, { type: "terminal_exit", code: 0 });
-    this.closeTerminal();
-  }
-
-  private async closeTerminal() {
-    if (this.terminalTimeout) {
-      clearTimeout(this.terminalTimeout);
-      this.terminalTimeout = null;
-    }
-    this.loginInProgress = false;
-
-    const sandboxId = this.ctx.id.toString().slice(0, 63);
-    const sandbox = getSandbox(this.env.Sandbox, sandboxId);
-    const env = { HOME: "/home/agent", CLAUDE_NO_AUTO_UPDATE: "1" };
-    await sandbox.exec(
-      "pkill -f 'claude login' 2>/dev/null; pkill -f 'sleep 300' 2>/dev/null; rm -f /tmp/term_in /tmp/term_key",
-      { timeout: 5000, env }
-    ).catch(() => {});
-
-    for (const ws of this.ctx.getWebSockets()) {
-      this.send(ws, { type: "done" });
-    }
-  }
-
-  private async hashToken(token: string): Promise<string> {
-    const data = new TextEncoder().encode(token);
-    const hash = await crypto.subtle.digest("SHA-256", data);
-    return [...new Uint8Array(hash)].map((b) => b.toString(16).padStart(2, "0")).join("");
-  }
-
-  private async handleEvent(ws: WebSocket, event: Record<string, unknown>) {
-    // Capture session ID for conversation continuity across turns
+  private async handleClaudeEvent(ws: WebSocket, event: Record<string, unknown>) {
     if (event.type === "system" && event.subtype === "init") {
       const id = event.session_id as string;
       if (id) await this.ctx.storage.put("sessionId", id);
     }
-
-    // Stream text chunks to client as they arrive
     if (event.type === "stream_event") {
       const e = event.event as Record<string, unknown>;
-      if (
-        e?.type === "content_block_delta" &&
-        (e.delta as Record<string, unknown>)?.type === "text_delta"
-      ) {
-        this.send(ws, {
-          type: "text",
-          content: ((e.delta as Record<string, unknown>).text as string) ?? "",
-        });
+      if (e?.type === "content_block_delta" && (e.delta as Record<string, unknown>)?.type === "text_delta") {
+        this.send(ws, { type: "text", content: ((e.delta as Record<string, unknown>).text as string) ?? "" });
       }
     }
-
-    // Show tool calls (Claude Code executes these internally in the container)
     if (event.type === "assistant") {
       const content = (event.message as Record<string, unknown>)?.content as unknown[];
       for (const block of content ?? []) {
@@ -321,8 +272,6 @@ export class AgentSession extends DurableObject<Env> {
         }
       }
     }
-
-    // Show tool results
     if (event.type === "user") {
       const content = (event.message as Record<string, unknown>)?.content as unknown[];
       for (const block of content ?? []) {
@@ -335,5 +284,11 @@ export class AgentSession extends DurableObject<Env> {
         }
       }
     }
+  }
+
+  private async hashToken(token: string): Promise<string> {
+    const data = new TextEncoder().encode(token);
+    const hash = await crypto.subtle.digest("SHA-256", data);
+    return [...new Uint8Array(hash)].map((b) => b.toString(16).padStart(2, "0")).join("");
   }
 }
