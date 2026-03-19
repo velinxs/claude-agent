@@ -71,6 +71,11 @@ if ! command -v cloudflared &>/dev/null; then
   chmod +x /usr/local/bin/cloudflared
 fi
 
+# --- rclone (Google Drive FUSE + other cloud storage) ---
+if ! command -v rclone &>/dev/null; then
+  curl -fsSL https://rclone.org/install.sh | bash
+fi
+
 # --- gcloud CLI ---
 if ! command -v gcloud &>/dev/null; then
   echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" > /etc/apt/sources.list.d/google-cloud-sdk.list
@@ -103,6 +108,51 @@ else
   echo "[bootstrap] WARNING: No bucket-name in metadata, skipping mount"
 fi
 
+# --- Mount Google Drive via rclone (if OAuth token provided) ---
+DRIVE_TOKEN=$(curl -sf -H "$MHDR" "$META/instance/attributes/drive-token" || echo "")
+DRIVE_DIR="/home/agent/drive"
+mkdir -p "$DRIVE_DIR"
+chown agent:agent "$DRIVE_DIR"
+
+if [ -n "$DRIVE_TOKEN" ]; then
+  # Configure rclone for Google Drive using the OAuth token from our platform
+  mkdir -p /home/agent/.config/rclone
+  cat > /home/agent/.config/rclone/rclone.conf << RCLONEEOF
+[gdrive]
+type = drive
+token = ${DRIVE_TOKEN}
+scope = drive
+RCLONEEOF
+  chown -R agent:agent /home/agent/.config/rclone
+  chmod 600 /home/agent/.config/rclone/rclone.conf
+
+  # Mount as systemd service so it persists
+  cat > /etc/systemd/system/gdrive-mount.service << EOF
+[Unit]
+Description=Google Drive FUSE mount
+After=network-online.target
+
+[Service]
+Type=simple
+User=agent
+Environment=HOME=/home/agent
+ExecStart=/usr/bin/rclone mount gdrive: ${DRIVE_DIR} --vfs-cache-mode writes --vfs-cache-max-age 1h --allow-other
+ExecStop=/bin/fusermount -uz ${DRIVE_DIR}
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable gdrive-mount
+  systemctl start gdrive-mount
+  echo "[bootstrap] Google Drive mounted at $DRIVE_DIR"
+else
+  echo "[bootstrap] No drive-token in metadata, skipping Drive mount"
+fi
+
 # --- Agent config ---
 mkdir -p /home/agent/.claude /home/agent/.ironclaw /home/agent/workspace
 cat > /home/agent/.claude/CLAUDE.md << 'EOF'
@@ -110,11 +160,19 @@ cat > /home/agent/.claude/CLAUDE.md << 'EOF'
 You are running on a GCP VM provisioned by the user.
 - User: `agent` (passwordless sudo)
 - Home: /home/agent
-- Persistent storage: /home/agent/storage (GCS bucket, survives VM restarts)
-- Workspace: /home/agent/workspace
-- Tools: IronClaw, Claude CLI, Node.js, Python3, git, gcloud, tmux
-- Full internet access — install anything with apt/npm/pip
-- Use /home/agent/storage for anything you want to persist
+
+## Storage
+- /home/agent/workspace/  — local SSD, fast, use for active work (ephemeral)
+- /home/agent/storage/    — GCS bucket via gcsfuse, persistent across VM restarts
+- /home/agent/drive/      — Google Drive via rclone (if connected), user's files
+
+Work in workspace/ for speed. Save results to storage/ for persistence.
+If the user's Drive is mounted, you can read their files from drive/ and
+save deliverables there so they can access them from any device.
+
+## Tools
+IronClaw, Claude CLI, Node.js, Python3, git, gcloud, rclone, tmux
+Full internet access — install anything with apt/npm/pip
 EOF
 
 cat > /home/agent/.ironclaw/.env << EOF

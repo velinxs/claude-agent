@@ -169,6 +169,16 @@ done
 - Paid: team buckets (we host on our GCP, charge monthly per team)
 - Public buckets: free to mount, we pay hosting (community goodwill / network effect)
 
+### GCP IAM / Cloud Roles API
+Worth exploring for managed tier: when we create per-customer GCP projects, we could use
+the Cloud IAM API + Cloud Resource Manager to programmatically:
+- Create projects per paying customer
+- Set up service accounts with scoped roles (compute.instanceAdmin, storage.objectAdmin)
+- Enforce least-privilege — customer VMs can only access their own buckets
+- Shared/team buckets: grant cross-project bucket access via IAM bindings
+- Could also use Organization Policies to prevent customers from escalating permissions
+Circle back to this when building the managed billing tier.
+
 ### Future: Real-Time Layer
 
 For low-latency agent-to-agent (sub-second), could layer Pub/Sub or Redis on top.
