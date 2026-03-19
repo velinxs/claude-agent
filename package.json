@@ -3,9 +3,11 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
-    "type-check": "tsc --noEmit"
+    "dev:client": "cd client && npx vite",
+    "build:client": "cd client && npx vite build",
+    "dev": "npm run build:client && wrangler dev",
+    "deploy": "npm run build:client && wrangler deploy",
+    "type-check": "tsc --noEmit && cd client && npx tsc --noEmit"
   },
   "dependencies": {
     "@cloudflare/sandbox": "^0.7.18"

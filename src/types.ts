@@ -6,6 +6,7 @@ export type ClientMessage =
   | { type: "interrupt" }
   | { type: "reset" }
   | { type: "login" }
+  | { type: "login_code"; code: string }
   | { type: "ping" };
 
 // Messages from server → client
@@ -16,6 +17,7 @@ export type ServerMessage =
   | { type: "done" }
   | { type: "error"; message: string }
   | { type: "login_url"; url: string }
+  | { type: "login_code_prompt"; message: string }
   | { type: "login_success" }
   | { type: "login_status"; authenticated: boolean };
 
