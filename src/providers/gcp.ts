@@ -22,7 +22,8 @@ export class GCPProvider implements CloudProvider {
           boot: true,
           autoDelete: true,
           initializeParams: {
-            sourceImage: "projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts-amd64",
+            // Use golden image if available (pre-baked with all tools), fall back to Ubuntu
+            sourceImage: `projects/${opts.project}/global/images/family/agent-golden`,
             diskSizeGb: "20",
           },
         },
