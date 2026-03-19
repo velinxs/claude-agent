@@ -1,37 +1,16 @@
 import type { Env } from "./types";
 import { GCPProvider, getGCPAuthUrl, exchangeGCPCode, listGCPProjects } from "./providers/gcp";
 
-export { AgentSession } from "./session";
-export { Sandbox } from "@cloudflare/sandbox";
-
 const gcp = new GCPProvider();
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
-    // --- WebSocket for CF Sandbox mode (existing) ---
-    if (url.pathname === "/ws") {
-      const upgradeHeader = request.headers.get("Upgrade");
-      if (upgradeHeader !== "websocket") {
-        return new Response("Expected WebSocket", { status: 426 });
-      }
-      const sessionId = url.searchParams.get("session") ?? crypto.randomUUID();
-      const stub = env.AGENT_SESSION.get(env.AGENT_SESSION.idFromName(sessionId));
-      const res = await stub.fetch(request);
-      const headers = new Headers(res.headers);
-      headers.set("X-Session-Id", sessionId);
-      return new Response(res.body, {
-        status: res.status,
-        webSocket: (res as unknown as { webSocket: WebSocket }).webSocket,
-        headers,
-      });
-    }
-
     // --- API Routes ---
 
     if (url.pathname === "/api/health") {
-      return Response.json({ status: "ok", version: "0.2.0" });
+      return Response.json({ status: "ok", version: "0.3.0" });
     }
 
     // GCP OAuth: initiate
@@ -54,7 +33,6 @@ export default {
       try {
         const redirectUri = `${url.origin}/api/auth/gcp/callback`;
         const tokens = await exchangeGCPCode(code, env.GCP_CLIENT_ID, env.GCP_CLIENT_SECRET, redirectUri);
-        // Return tokens to the frontend via postMessage (popup flow)
         return new Response(
           `<!DOCTYPE html><html><body><script>
             window.opener.postMessage(${JSON.stringify({ type: "gcp_auth", ...tokens })}, "*");
@@ -80,12 +58,13 @@ export default {
       const token = request.headers.get("Authorization")?.replace("Bearer ", "");
       if (!token) return Response.json({ error: "No token" }, { status: 401 });
       try {
-        const body = (await request.json()) as { project: string; zone?: string; machineType?: string };
+        const body = (await request.json()) as { project: string; zone?: string; machineType?: string; userId?: string };
         const instance = await gcp.provision({
           accessToken: token,
           project: body.project,
           zone: body.zone,
           machineType: body.machineType,
+          userId: body.userId,
         });
         return Response.json({ instance });
       } catch (err) {
@@ -93,7 +72,7 @@ export default {
       }
     }
 
-    // Get VM status (poll for tunnel URL)
+    // Get VM status
     if (url.pathname.startsWith("/api/status/") && request.method === "GET") {
       const token = request.headers.get("Authorization")?.replace("Bearer ", "");
       if (!token) return Response.json({ error: "No token" }, { status: 401 });
@@ -121,11 +100,6 @@ export default {
       } catch (err) {
         return Response.json({ error: String(err) }, { status: 500 });
       }
-    }
-
-    // Health check (legacy)
-    if (url.pathname === "/health") {
-      return Response.json({ status: "ok", version: "0.2.0" });
     }
 
     // Serve static assets
