@@ -1,0 +1,43 @@
+{
+  "name": "claude-agent",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-01-01",
+  "compatibility_flags": ["nodejs_compat"],
+
+  "assets": {
+    "directory": "public",
+    "binding": "ASSETS"
+  },
+
+  "durable_objects": {
+    "bindings": [
+      { "name": "AGENT_SESSION", "class_name": "AgentSession" },
+      { "name": "Sandbox", "class_name": "Sandbox" }
+    ]
+  },
+
+  "containers": [
+    {
+      "class_name": "Sandbox",
+      "image": "./Dockerfile",
+      "instance_type": "lite",
+      "max_instances": 10
+    }
+  ],
+
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["AgentSession", "Sandbox"]
+    }
+  ],
+
+  "r2_buckets": [
+    {
+      "binding": "AGENT_STORAGE",
+      "bucket_name": "agent-storage"
+    }
+  ],
+
+  "observability": { "enabled": true }
+}

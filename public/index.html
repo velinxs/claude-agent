@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, viewport-fit=cover">
+<title>Claude Agent</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #0d0d0d; color: #e0e0e0; font-family: 'Courier New', monospace; height: 100vh; display: flex; flex-direction: column; }
+  #header { padding: 10px 12px; border-bottom: 1px solid #222; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; background: #111; }
+  #header h1 { font-size: 14px; color: #888; font-weight: normal; }
+  #status { width: 8px; height: 8px; border-radius: 50%; background: #444; flex-shrink: 0; }
+  #status.connected { background: #4ade80; }
+  #status.working { background: #fb923c; animation: pulse 1s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+  #setup { display: flex; gap: 8px; margin-left: auto; flex-shrink: 1; min-width: 0; }
+  #setup input { background: #1a1a1a; border: 1px solid #333; color: #e0e0e0; padding: 6px 8px; font-size: 13px; font-family: inherit; border-radius: 4px; width: 200px; min-width: 0; flex-shrink: 1; }
+  #setup select { background: #1a1a1a; border: 1px solid #333; color: #e0e0e0; padding: 6px 8px; font-size: 13px; font-family: inherit; border-radius: 4px; flex-shrink: 0; }
+  #login-btn { background: #1e3a5f; color: #7dd3fc; border: 1px solid #2d5f8f; padding: 6px 12px; font-size: 13px; font-family: inherit; border-radius: 4px; cursor: pointer; flex-shrink: 0; }
+  #login-btn:hover { background: #2d5f8f; }
+  #login-btn.authed { background: #14532d; color: #4ade80; border-color: #166534; }
+  #login-btn.authed:hover { background: #166534; }
+  #messages { flex: 1; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 12px; -webkit-overflow-scrolling: touch; }
+  .msg { max-width: 100%; }
+  .msg.user { color: #7dd3fc; }
+  .msg.user::before { content: '> '; color: #555; }
+  .msg.assistant { color: #e0e0e0; white-space: pre-wrap; word-break: break-word; font-size: 14px; line-height: 1.5; }
+  .tool-block { background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 6px; margin: 4px 0; overflow: hidden; }
+  .tool-header { padding: 6px 10px; background: #222; color: #888; font-size: 12px; display: flex; align-items: center; gap: 8px; }
+  .tool-name { color: #fb923c; }
+  .tool-output { padding: 8px 10px; font-size: 12px; color: #a0a0a0; white-space: pre-wrap; word-break: break-word; max-height: 200px; overflow-y: auto; }
+  .tool-output.running { color: #555; font-style: italic; }
+  #input-area { padding: 8px 10px; padding-bottom: max(8px, env(safe-area-inset-bottom)); border-top: 1px solid #222; background: #111; display: flex; gap: 6px; align-items: flex-end; }
+  #input { flex: 1; background: #1a1a1a; border: 1px solid #333; color: #e0e0e0; padding: 10px 12px; font-family: inherit; font-size: 16px; border-radius: 8px; resize: none; height: 44px; max-height: 200px; overflow-y: auto; }
+  #input:focus { outline: none; border-color: #555; }
+  #send-btn { background: #1e3a5f; color: #7dd3fc; border: 1px solid #2d5f8f; padding: 10px 14px; font-family: inherit; font-size: 14px; border-radius: 8px; cursor: pointer; white-space: nowrap; min-height: 44px; }
+  #send-btn:hover { background: #2d5f8f; }
+  #send-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  #reset-btn { background: transparent; color: #555; border: 1px solid #333; padding: 10px 8px; font-family: inherit; font-size: 12px; border-radius: 8px; cursor: pointer; min-height: 44px; }
+  #reset-btn:hover { color: #888; border-color: #555; }
+  @media (max-width: 500px) {
+    #header { gap: 6px; }
+    #header h1 { font-size: 13px; }
+    #setup { width: 100%; margin-left: 0; }
+    #setup input { flex: 1; width: auto; }
+    .msg.assistant { font-size: 13px; }
+  }
+</style>
+</head>
+<body>
+
+<div id="header">
+  <div id="status"></div>
+  <h1>claude agent</h1>
+  <div id="setup">
+    <select id="model-select">
+      <option value="claude-sonnet-4-6">sonnet 4.6</option>
+      <option value="claude-opus-4-6">opus 4.6</option>
+      <option value="claude-haiku-4-5-20251001">haiku 4.5</option>
+    </select>
+    <button id="login-btn" title="Login with Claude Max OAuth">connect</button>
+    <input id="token-input" type="password" placeholder="or paste token..." style="width:140px;" />
+  </div>
+</div>
+
+<div id="messages"></div>
+
+<div id="input-area">
+  <button id="reset-btn" title="New session">/reset</button>
+  <textarea id="input" placeholder="Ask anything or give a task..." rows="1"></textarea>
+  <button id="send-btn" disabled>send</button>
+</div>
+
+<script>
+let ws = null;
+let sessionId = localStorage.getItem('sessionId');
+if (!sessionId) {
+  sessionId = crypto.randomUUID();
+  localStorage.setItem('sessionId', sessionId);
+}
+let currentAssistantEl = null;
+let currentToolOutputEl = null;
+let isWorking = false;
+let pingInterval = null;
+
+const statusEl = document.getElementById('status');
+const messagesEl = document.getElementById('messages');
+const inputEl = document.getElementById('input');
+const sendBtn = document.getElementById('send-btn');
+const resetBtn = document.getElementById('reset-btn');
+const tokenInput = document.getElementById('token-input');
+const modelSelect = document.getElementById('model-select');
+const loginBtn = document.getElementById('login-btn');
+
+let oauthAuthenticated = false;
+
+const savedToken = localStorage.getItem('token');
+const savedModel = localStorage.getItem('model');
+if (savedToken) tokenInput.value = savedToken;
+if (savedModel) modelSelect.value = savedModel;
+
+tokenInput.addEventListener('change', () => {
+  localStorage.setItem('token', tokenInput.value);
+});
+
+modelSelect.addEventListener('change', () => {
+  localStorage.setItem('model', modelSelect.value);
+});
+
+loginBtn.addEventListener('click', () => {
+  if (!ws || ws.readyState !== 1 || isWorking) return;
+  ws.send(JSON.stringify({ type: 'login' }));
+  setWorking(true);
+  loginBtn.textContent = 'connecting...';
+});
+
+function addUserMessage(content) {
+  const el = document.createElement('div');
+  el.className = 'msg user';
+  el.textContent = content;
+  messagesEl.appendChild(el);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+function addToolBlock(name, inputObj) {
+  const block = document.createElement('div');
+  block.className = 'tool-block';
+
+  const header = document.createElement('div');
+  header.className = 'tool-header';
+  const nameEl = document.createElement('span');
+  nameEl.className = 'tool-name';
+  nameEl.textContent = name;
+  header.appendChild(nameEl);
+  block.appendChild(header);
+
+  const outputEl = document.createElement('div');
+  outputEl.className = 'tool-output running';
+  if (inputObj) {
+    const preview = JSON.stringify(inputObj, null, 2);
+    outputEl.textContent = (preview.length > 500 ? preview.slice(0, 500) + '...' : preview) + '\n\nrunning...';
+  } else {
+    outputEl.textContent = 'running...';
+  }
+  block.appendChild(outputEl);
+  messagesEl.appendChild(block);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+  return outputEl;
+}
+
+function addErrorMessage(text) {
+  const el = document.createElement('div');
+  el.className = 'msg assistant';
+  el.style.color = '#f87171';
+  el.textContent = '[error] ' + text;
+  messagesEl.appendChild(el);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+function setWorking(working) {
+  isWorking = working;
+  statusEl.className = working ? 'working' : 'connected';
+  sendBtn.disabled = working;
+  sendBtn.textContent = working ? 'working...' : 'send';
+}
+
+function connect() {
+  if (ws) { try { ws.close(); } catch {} }
+  if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
+  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const url = protocol + '//' + location.host + '/ws?session=' + encodeURIComponent(sessionId);
+  ws = new WebSocket(url);
+
+  ws.onopen = () => {
+    statusEl.className = 'connected';
+    sendBtn.disabled = false;
+    setWorking(false);
+    pingInterval = setInterval(() => {
+      if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'ping' }));
+    }, 30000);
+  };
+  ws.onclose = () => {
+    statusEl.className = '';
+    sendBtn.disabled = true;
+    if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
+    setTimeout(connect, 3000);
+  };
+
+  ws.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+
+    if (msg.type === 'text') {
+      if (!currentAssistantEl) {
+        currentAssistantEl = document.createElement('div');
+        currentAssistantEl.className = 'msg assistant';
+        messagesEl.appendChild(currentAssistantEl);
+      }
+      currentAssistantEl.textContent += msg.content;
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+
+    if (msg.type === 'tool_start') {
+      currentAssistantEl = null;
+      currentToolOutputEl = addToolBlock(msg.name, msg.input);
+    }
+
+    if (msg.type === 'tool_output') {
+      if (currentToolOutputEl) {
+        currentToolOutputEl.classList.remove('running');
+        currentToolOutputEl.textContent = msg.output || '(done)';
+        currentToolOutputEl = null;
+      }
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+
+    if (msg.type === 'done') {
+      setWorking(false);
+      currentAssistantEl = null;
+      currentToolOutputEl = null;
+    }
+
+    if (msg.type === 'login_url') {
+      window.open(msg.url, '_blank');
+      const el = document.createElement('div');
+      el.className = 'msg assistant';
+      const link = document.createElement('a');
+      link.href = msg.url;
+      link.target = '_blank';
+      link.style.color = '#7dd3fc';
+      link.textContent = msg.url.length > 80 ? msg.url.slice(0, 80) + '...' : msg.url;
+      el.textContent = 'Open this link to authenticate: ';
+      el.appendChild(link);
+      messagesEl.appendChild(el);
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+
+    if (msg.type === 'login_success') {
+      oauthAuthenticated = true;
+      loginBtn.textContent = 'connected';
+      loginBtn.className = 'authed';
+      tokenInput.value = '';
+      localStorage.removeItem('token');
+    }
+
+    if (msg.type === 'login_status') {
+      oauthAuthenticated = msg.authenticated;
+      if (msg.authenticated) {
+        loginBtn.textContent = 'connected';
+        loginBtn.className = 'authed';
+      }
+    }
+
+    if (msg.type === 'error') {
+      addErrorMessage(msg.message);
+      setWorking(false);
+      if (loginBtn.textContent === 'connecting...') loginBtn.textContent = 'connect';
+    }
+  };
+}
+
+function send() {
+  const content = inputEl.value.trim();
+  const token = tokenInput.value.trim();
+  if (!content || !ws || ws.readyState !== 1 || isWorking) return;
+  if (!token && !oauthAuthenticated) {
+    addErrorMessage('Click "connect" to login with Claude, or paste a token.');
+    return;
+  }
+
+  addUserMessage(content);
+  const payload = { type: 'message', content, model: modelSelect.value };
+  if (token) payload.token = token;
+  ws.send(JSON.stringify(payload));
+
+  inputEl.value = '';
+  inputEl.style.height = '40px';
+  currentAssistantEl = null;
+  currentToolOutputEl = null;
+  setWorking(true);
+}
+
+resetBtn.addEventListener('click', () => {
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'reset' }));
+  messagesEl.textContent = '';
+  sessionId = null;
+  localStorage.removeItem('sessionId');
+  currentAssistantEl = null;
+  currentToolOutputEl = null;
+  setWorking(false);
+});
+
+sendBtn.addEventListener('click', send);
+
+inputEl.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+  setTimeout(() => {
+    inputEl.style.height = 'auto';
+    inputEl.style.height = Math.min(inputEl.scrollHeight, 200) + 'px';
+  }, 0);
+});
+
+connect();
+</script>
+</body>
+</html>
