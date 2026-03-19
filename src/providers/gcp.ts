@@ -1,5 +1,4 @@
 import type { CloudProvider, AgentInstance, ProvisionOptions } from "./types";
-
 import { STARTUP_SCRIPT } from "./startup";
 
 const GCP_COMPUTE_BASE = "https://compute.googleapis.com/compute/v1";
@@ -11,6 +10,7 @@ export class GCPProvider implements CloudProvider {
     const zone = opts.zone ?? "us-central1-a";
     const machineType = opts.machineType ?? "e2-small";
     const instanceName = `agent-${Date.now().toString(36)}`;
+    const bucketName = `agent-storage-${opts.project}-${opts.userId ?? "default"}`;
 
     const url = `${GCP_COMPUTE_BASE}/projects/${opts.project}/zones/${zone}/instances`;
 
@@ -37,13 +37,19 @@ export class GCPProvider implements CloudProvider {
         items: [
           { key: "startup-script", value: STARTUP_SCRIPT },
           { key: "agent-status", value: "provisioning" },
+          { key: "bucket-name", value: bucketName },
+          { key: "user-id", value: opts.userId ?? "default" },
         ],
       },
       tags: { items: ["agent-vm"] },
       serviceAccounts: [
         {
           email: "default",
-          scopes: ["https://www.googleapis.com/auth/compute"],
+          scopes: [
+            "https://www.googleapis.com/auth/compute",
+            "https://www.googleapis.com/auth/devstorage.full_control",
+            "https://www.googleapis.com/auth/logging.write",
+          ],
         },
       ],
     };
@@ -67,6 +73,7 @@ export class GCPProvider implements CloudProvider {
       provider: "gcp",
       status: "provisioning",
       region: zone,
+      bucketName,
       createdAt: Date.now(),
     };
   }
@@ -77,19 +84,13 @@ export class GCPProvider implements CloudProvider {
     instanceId: string;
     zone: string;
   }): Promise<AgentInstance> {
-    // Get instance details
     const url = `${GCP_COMPUTE_BASE}/projects/${opts.project}/zones/${opts.zone}/instances/${opts.instanceId}`;
     const res = await fetch(url, {
       headers: { Authorization: `Bearer ${opts.accessToken}` },
     });
 
     if (!res.ok) {
-      return {
-        id: opts.instanceId,
-        provider: "gcp",
-        status: "error",
-        createdAt: 0,
-      };
+      return { id: opts.instanceId, provider: "gcp", status: "error", createdAt: 0 };
     }
 
     const instance = (await res.json()) as {
@@ -97,29 +98,22 @@ export class GCPProvider implements CloudProvider {
       metadata?: { items?: Array<{ key: string; value: string }> };
     };
 
-    // Read metadata for tunnel URL and auth token
     const metadata = instance.metadata?.items ?? [];
-    const tunnelUrl = metadata.find((m) => m.key === "tunnel-url")?.value;
-    const authToken = metadata.find((m) => m.key === "auth-token")?.value;
-    const agentStatus = metadata.find((m) => m.key === "agent-status")?.value;
+    const get = (key: string) => metadata.find((m) => m.key === key)?.value;
 
     let status: AgentInstance["status"] = "provisioning";
-    if (instance.status === "RUNNING" && agentStatus === "ready") {
-      status = "ready";
-    } else if (instance.status === "RUNNING") {
-      status = "running";
-    } else if (instance.status === "TERMINATED" || instance.status === "STOPPED") {
-      status = "stopped";
-    } else if (agentStatus === "tunnel_failed") {
-      status = "error";
-    }
+    if (instance.status === "RUNNING" && get("agent-status") === "ready") status = "ready";
+    else if (instance.status === "RUNNING") status = "running";
+    else if (instance.status === "TERMINATED" || instance.status === "STOPPED") status = "stopped";
+    else if (get("agent-status") === "tunnel_failed") status = "error";
 
     return {
       id: opts.instanceId,
       provider: "gcp",
       status,
-      tunnelUrl,
-      authToken,
+      tunnelUrl: get("tunnel-url"),
+      authToken: get("auth-token"),
+      bucketName: get("bucket-name"),
       region: opts.zone,
       createdAt: 0,
     };
@@ -139,13 +133,18 @@ export class GCPProvider implements CloudProvider {
   }
 }
 
-// OAuth helpers
+// --- OAuth helpers ---
+
 export function getGCPAuthUrl(clientId: string, redirectUri: string, state: string): string {
   const params = new URLSearchParams({
     client_id: clientId,
     redirect_uri: redirectUri,
     response_type: "code",
-    scope: "https://www.googleapis.com/auth/compute https://www.googleapis.com/auth/cloudplatformprojects.readonly",
+    scope: [
+      "https://www.googleapis.com/auth/compute",
+      "https://www.googleapis.com/auth/devstorage.full_control",
+      "https://www.googleapis.com/auth/cloudplatformprojects.readonly",
+    ].join(" "),
     access_type: "offline",
     prompt: "consent",
     state,

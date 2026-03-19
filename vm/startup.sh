@@ -2,8 +2,8 @@
 set -euo pipefail
 
 # === Agent VM Bootstrap Script ===
-# Runs on user's GCP VM via startup-script metadata.
-# Installs ttyd + agent tools + cloudflared, then exposes terminal via tunnel.
+# Installs IronClaw + ttyd + gcsfuse, mounts GCS bucket, exposes terminal via tunnel.
+# Metadata inputs: bucket-name, user-id
 
 export DEBIAN_FRONTEND=noninteractive
 LOG="/var/log/agent-bootstrap.log"
@@ -11,13 +11,21 @@ exec > >(tee -a "$LOG") 2>&1
 
 echo "[bootstrap] Starting agent VM setup..."
 
+# Read metadata
+META="http://metadata.google.internal/computeMetadata/v1"
+MHDR="Metadata-Flavor: Google"
+BUCKET=$(curl -sf -H "$MHDR" "$META/instance/attributes/bucket-name" || echo "")
+USER_ID=$(curl -sf -H "$MHDR" "$META/instance/attributes/user-id" || echo "unknown")
+PROJECT=$(curl -sf -H "$MHDR" "$META/project/project-id" || echo "")
+
+echo "[bootstrap] bucket=$BUCKET user=$USER_ID project=$PROJECT"
+
 # --- System packages ---
 apt-get update -qq
 apt-get install -y -qq \
   build-essential git curl wget jq python3 python3-pip python3-venv \
-  openssh-client rsync zip unzip vim nano less htop \
-  dnsutils net-tools ca-certificates gnupg sudo tmux \
-  libwebsockets-dev libjson-c-dev cmake pkg-config
+  openssh-client rsync zip unzip vim nano less htop tmux \
+  dnsutils net-tools ca-certificates gnupg sudo fuse
 
 # --- Node.js 22 ---
 if ! command -v node &>/dev/null; then
@@ -25,17 +33,35 @@ if ! command -v node &>/dev/null; then
   apt-get install -y -qq nodejs
 fi
 
-# --- ttyd (terminal over web) ---
-if ! command -v ttyd &>/dev/null; then
-  TTYD_VERSION="1.7.7"
-  curl -sL "https://github.com/tsl0922/ttyd/releases/download/${TTYD_VERSION}/ttyd.x86_64" \
-    -o /usr/local/bin/ttyd
-  chmod +x /usr/local/bin/ttyd
+# --- gcsfuse (Google Cloud Storage FUSE) ---
+if ! command -v gcsfuse &>/dev/null; then
+  curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
+  echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt gcsfuse-jammy main" > /etc/apt/sources.list.d/gcsfuse.list
+  apt-get update -qq
+  apt-get install -y -qq gcsfuse
+fi
+
+# --- IronClaw ---
+if ! command -v ironclaw &>/dev/null; then
+  curl --proto '=https' --tlsv1.2 -LsSf \
+    https://github.com/nearai/ironclaw/releases/latest/download/ironclaw-installer.sh | sh
+  # Installer puts it in various places depending on version
+  for p in /root/.cargo/bin/ironclaw /root/.ironclaw/bin/ironclaw /root/.local/bin/ironclaw; do
+    [ -f "$p" ] && cp "$p" /usr/local/bin/ironclaw && break
+  done
+  chmod +x /usr/local/bin/ironclaw 2>/dev/null || true
 fi
 
 # --- Claude Code CLI ---
 if ! command -v claude &>/dev/null; then
   npm install -g @anthropic-ai/claude-code
+fi
+
+# --- ttyd ---
+if ! command -v ttyd &>/dev/null; then
+  curl -sL "https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64" \
+    -o /usr/local/bin/ttyd
+  chmod +x /usr/local/bin/ttyd
 fi
 
 # --- Cloudflared ---
@@ -45,34 +71,65 @@ if ! command -v cloudflared &>/dev/null; then
   chmod +x /usr/local/bin/cloudflared
 fi
 
+# --- gcloud CLI ---
+if ! command -v gcloud &>/dev/null; then
+  echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" > /etc/apt/sources.list.d/google-cloud-sdk.list
+  apt-get update -qq
+  apt-get install -y -qq google-cloud-cli
+fi
+
 # --- Create agent user ---
 if ! id agent &>/dev/null; then
   useradd -m -s /bin/bash agent
   echo "agent ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+  usermod -aG fuse agent
 fi
 
-# --- Generate auth token for ttyd ---
-AUTH_TOKEN=$(head -c 32 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 24)
-echo "$AUTH_TOKEN" > /home/agent/.ttyd_token
-chown agent:agent /home/agent/.ttyd_token
+# --- Mount GCS bucket via gcsfuse ---
+MOUNT_DIR="/home/agent/storage"
+mkdir -p "$MOUNT_DIR"
+chown agent:agent "$MOUNT_DIR"
 
-# --- Write agent CLAUDE.md ---
-cat > /home/agent/.claude/CLAUDE.md << 'AGENTEOF'
+if [ -n "$BUCKET" ]; then
+  # Create bucket if it doesn't exist (VM service account needs storage admin)
+  gsutil ls "gs://$BUCKET" 2>/dev/null || gsutil mb -p "$PROJECT" -l us-central1 "gs://$BUCKET" 2>/dev/null || true
+
+  # Mount with gcsfuse — allow agent user, enable write
+  gcsfuse --uid "$(id -u agent)" --gid "$(id -g agent)" \
+    --implicit-dirs --rename-dir-limit=1000000 \
+    "$BUCKET" "$MOUNT_DIR"
+  echo "[bootstrap] GCS bucket $BUCKET mounted at $MOUNT_DIR"
+else
+  echo "[bootstrap] WARNING: No bucket-name in metadata, skipping mount"
+fi
+
+# --- Agent config ---
+mkdir -p /home/agent/.claude /home/agent/.ironclaw /home/agent/workspace
+cat > /home/agent/.claude/CLAUDE.md << 'EOF'
 # Agent Environment
-You are running on a cloud VM provisioned by the user.
+You are running on a GCP VM provisioned by the user.
 - User: `agent` (passwordless sudo)
 - Home: /home/agent
-- Tools: Node.js, Python3, git, curl, build-essential, tmux
-- Claude Code CLI is available
-- Full internet access
-- You can install any packages with apt/npm/pip
-AGENTEOF
-mkdir -p /home/agent/.claude
-chown -R agent:agent /home/agent/.claude
+- Persistent storage: /home/agent/storage (GCS bucket, survives VM restarts)
+- Workspace: /home/agent/workspace
+- Tools: IronClaw, Claude CLI, Node.js, Python3, git, gcloud, tmux
+- Full internet access — install anything with apt/npm/pip
+- Use /home/agent/storage for anything you want to persist
+EOF
 
-# --- Start ttyd ---
-# Runs as agent user, serves bash with auth token
-# -W = writable, -p = port, -c = credentials (user:pass)
+cat > /home/agent/.ironclaw/.env << EOF
+DATABASE_URL=file:///home/agent/storage/.ironclaw/data.db
+NEAR_ENABLED=false
+SANDBOX_ENABLED=true
+IRONCLAW_DATA_DIR=/home/agent/storage
+EOF
+
+chown -R agent:agent /home/agent
+
+# --- Generate auth token ---
+AUTH_TOKEN=$(head -c 32 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 24)
+
+# --- ttyd service ---
 cat > /etc/systemd/system/ttyd.service << EOF
 [Unit]
 Description=ttyd terminal server
@@ -82,6 +139,7 @@ After=network.target
 Type=simple
 User=agent
 Environment=HOME=/home/agent
+WorkingDirectory=/home/agent/workspace
 ExecStart=/usr/local/bin/ttyd -W -p 7681 -c agent:${AUTH_TOKEN} -t fontSize=14 -t theme={"background":"#0a0a0a","foreground":"#e0e0e0"} bash
 Restart=always
 RestartSec=3
@@ -90,11 +148,7 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
 
-systemctl daemon-reload
-systemctl enable ttyd
-systemctl start ttyd
-
-# --- Start cloudflared tunnel ---
+# --- Cloudflared tunnel service ---
 cat > /etc/systemd/system/agent-tunnel.service << EOF
 [Unit]
 Description=Cloudflared tunnel for ttyd
@@ -115,37 +169,24 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable agent-tunnel
-systemctl start agent-tunnel
+systemctl enable ttyd agent-tunnel
+systemctl start ttyd agent-tunnel
 
-# --- Wait for tunnel URL and write to instance metadata ---
+# --- Wait for tunnel URL → write to instance metadata ---
 echo "[bootstrap] Waiting for tunnel URL..."
 for i in $(seq 1 30); do
   TUNNEL_URL=$(journalctl -u agent-tunnel --no-pager -n 50 2>/dev/null | grep -oP 'https://[^\s]*\.trycloudflare\.com' | tail -1 || true)
   if [ -n "$TUNNEL_URL" ]; then
     echo "[bootstrap] Tunnel URL: $TUNNEL_URL"
-    # Write to instance metadata so the platform can read it
-    curl -s -X PUT \
-      "http://metadata.google.internal/computeMetadata/v1/instance/attributes/tunnel-url" \
-      -H "Metadata-Flavor: Google" \
-      -d "$TUNNEL_URL" 2>/dev/null || true
-    curl -s -X PUT \
-      "http://metadata.google.internal/computeMetadata/v1/instance/attributes/auth-token" \
-      -H "Metadata-Flavor: Google" \
-      -d "$AUTH_TOKEN" 2>/dev/null || true
-    curl -s -X PUT \
-      "http://metadata.google.internal/computeMetadata/v1/instance/attributes/agent-status" \
-      -H "Metadata-Flavor: Google" \
-      -d "ready" 2>/dev/null || true
-    echo "[bootstrap] Metadata written. Agent is ready!"
+    curl -sf -X PUT "$META/instance/attributes/tunnel-url" -H "$MHDR" -d "$TUNNEL_URL" || true
+    curl -sf -X PUT "$META/instance/attributes/auth-token" -H "$MHDR" -d "$AUTH_TOKEN" || true
+    curl -sf -X PUT "$META/instance/attributes/agent-status" -H "$MHDR" -d "ready" || true
+    echo "[bootstrap] Agent is ready!"
     exit 0
   fi
   echo "[bootstrap] Waiting... ($i/30)"
   sleep 5
 done
 
-echo "[bootstrap] WARNING: Could not get tunnel URL after 150s"
-curl -s -X PUT \
-  "http://metadata.google.internal/computeMetadata/v1/instance/attributes/agent-status" \
-  -H "Metadata-Flavor: Google" \
-  -d "tunnel_failed" 2>/dev/null || true
+echo "[bootstrap] WARNING: Could not get tunnel URL"
+curl -sf -X PUT "$META/instance/attributes/agent-status" -H "$MHDR" -d "tunnel_failed" || true

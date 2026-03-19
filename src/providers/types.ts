@@ -4,6 +4,7 @@ export interface AgentInstance {
   status: "provisioning" | "running" | "ready" | "error" | "stopped";
   tunnelUrl?: string;
   authToken?: string;
+  bucketName?: string;
   region?: string;
   createdAt: number;
 }
@@ -11,6 +12,7 @@ export interface AgentInstance {
 export interface ProvisionOptions {
   accessToken: string;
   project: string;
+  userId?: string;
   zone?: string;
   machineType?: string;
 }
