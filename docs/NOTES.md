@@ -89,3 +89,88 @@ This means:
 - "Normies" can still use it — the AI agent IS the UX layer. You talk to it in plain English, it does terminal things.
 - Smallest possible surface area to build and maintain
 - ttyd/gotty are battle-tested, sub-10ms latency, handle all the pty stuff correctly
+
+---
+
+## Agent-to-Agent Communication via Shared Buckets (March 2026)
+
+### The Filesystem IS the Protocol
+
+Instead of A2A, AMP, ACP, or any other agent-to-agent protocol — agents communicate
+through shared GCS buckets mounted via gcsfuse. No APIs, no discovery service, no auth
+between agents. Just files.
+
+### How It Works
+
+```
+/shared-bucket/                    (gcsfuse mounted on all team VMs)
+  context.md                       shared world state, read by all
+  soul.md                          team personality/goals, read by all
+  agent-1/                         agent 1's workspace
+    notes.md                       agent 1's scratch work
+  agent-2/                         agent 2's workspace
+    notes.md                       agent 2's scratch work
+  agent-1.inbox.md                 write here to "talk" to agent 1
+  agent-2.inbox.md                 write here to "talk" to agent 2
+```
+
+### Inbox Pattern — Conversations Through Files
+
+A file watcher (`inotifywait` or similar) on each VM watches `agent-X.inbox.md`.
+When the file changes:
+1. Watcher detects change
+2. Reads new content from the inbox file
+3. Injects it as a user message into IronClaw / Claude CLI
+4. Agent processes and responds by writing to the OTHER agent's inbox file
+
+That's a conversation. Through files. Over a shared bucket.
+
+```bash
+# agent-1's watcher (conceptual)
+inotifywait -m /shared/agent-1.inbox.md -e modify |
+while read; do
+  MSG=$(cat /shared/agent-1.inbox.md)
+  RESPONSE=$(echo "$MSG" | ironclaw chat --output text)
+  echo "$RESPONSE" >> /shared/agent-2.inbox.md
+done
+```
+
+### Why This Is Better Than API-Based Agent Protocols
+
+- **Zero infrastructure**: no message bus, no discovery service, no HTTP endpoints
+- **Already works**: gcsfuse + inotifywait + markdown. All exists today.
+- **Conversation history IS the file**: searchable, versionable, pipe-able
+- **AI agents already know how to read/write files**: no new capabilities needed
+- **Secure by default**: GCS IAM controls who mounts what bucket
+- **Async by nature**: agents don't need to be online simultaneously
+- **Human-readable**: you can open the inbox files and read the conversation
+- **Multi-agent**: any number of agents can mount the same bucket
+- **Cross-cloud**: agent on GCP can share a bucket with agent on AWS (via GCS interop)
+
+### gcsfuse Concurrency Rules
+
+- Multiple VMs can mount the same bucket simultaneously ✓
+- Multiple readers of the same file: safe ✓
+- Multiple writers to DIFFERENT files: safe ✓
+- Multiple writers to the SAME file: last-writer-wins (no locking)
+- Convention: each agent writes to its own files or to other agents' inboxes
+  (never two agents writing to the same inbox at once)
+
+### Bucket Types
+
+- **Private bucket**: one user, all their agents. Persistence + cross-agent workspace.
+- **Team bucket**: shared by a team/company. Agents collaborate via inboxes + context.md.
+- **Public bucket**: read-only community resources. Tools, datasets, shared knowledge.
+  Anyone can mount it. Curated by the community.
+
+### Revenue Angle
+
+- Free: private bucket (user's own GCS, they pay Google)
+- Paid: team buckets (we host on our GCP, charge monthly per team)
+- Public buckets: free to mount, we pay hosting (community goodwill / network effect)
+
+### Future: Real-Time Layer
+
+For low-latency agent-to-agent (sub-second), could layer Pub/Sub or Redis on top.
+File-based is fine for async collaboration (seconds to minutes). Real-time would need
+a message bus. But start with files — it's 90% of the use case.
