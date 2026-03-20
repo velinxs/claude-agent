@@ -1,35 +1,30 @@
 # Dev Notes
 
-## Terminal / Login Flow (March 2026)
+## Anthropic Claude OAuth / Setup Token (KEEP — needed for onboarding)
 
-### What works
-- xterm.js terminal opens on "connect", runs `claude login` inside sandbox via script(1) + FIFO
-- User can interact with the full CLI wizard (theme picker, auth URL, paste code)
-- Login completes successfully — auth persists in sandbox for subsequent `claude -p` calls
-- Output buffered 50ms to reduce screen tearing from split ANSI sequences
+### How Claude CLI Auth Works
+- `claude setup-token` generates an OAuth token (`sk-ant-oat01-...`) — 1 year validity
+- Set as `CLAUDE_CODE_OAUTH_TOKEN` env var or stored in `~/.claude/`
+- This token does NOT work with the Anthropic API directly — only with `claude` CLI
+- OpenClaw also supports `CLAUDE_CODE_OAUTH_TOKEN` natively
 
-### Problems
-- **Cold start**: blank terminal for minutes before any output appears. Cloudflare Sandbox containers have significant cold start time — the container needs to boot before `claude login` can run. No way to pre-warm.
-- **Input latency**: each keystroke requires writeFile + exec cat > FIFO — two sandbox round trips per key. Noticeable lag for interactive TUI.
-- **Screen tearing**: even with buffering, complex TUI rendering (the claude wizard with ASCII art, color themes, etc.) doesn't render cleanly through the proxy chain: xterm.js ↔ WebSocket ↔ Worker ↔ DO ↔ sandbox.exec ↔ script/pty ↔ CLI
-- **Architecture mismatch**: Cloudflare Sandbox is great for running CLI commands (fire and forget), not for interactive terminal sessions. The exec API has onOutput streaming but no stdin streaming — we hack around it with FIFOs.
+### Interactive Login Flow (claude login)
+- `claude login` runs a full interactive setup wizard:
+  1. Theme picker (TUI arrow-key selector)
+  2. Auth URL displayed — user visits in browser
+  3. User authenticates with Anthropic
+  4. Browser gives user a code to paste back
+  5. CLI stores OAuth credentials
+- The wizard needs a real TTY — can't be automated through pipes easily
+- We tried: FIFO + script(1) + xterm.js — it worked but was laggy and fragile
 
-### GCP alternative?
-Might be worth revisiting GCP for the container runtime:
-- GCP Cloud Run or Compute Engine VMs have faster cold starts (especially with min instances)
-- Could run actual ttyd or gotty for native web terminal with zero proxying
-- SSH directly into a VM gives real pty with no FIFO hacks
-- Could still use Cloudflare Workers as the frontend/routing layer
-- Tradeoff: more infra to manage, not "serverless edge" anymore
-
-### Other approaches considered
-- **Automate the wizard**: tried sending keystrokes programmatically (echo to FIFO). TUI uses raw terminal mode, arrow-key selectors, etc. — too fragile.
-- **Pre-configure CLI**: write settings files to skip wizard. Haven't found the right config format yet.
-- **`claude setup-token`**: generates token non-interactively but still requires initial interactive auth.
-- **ttyd inside sandbox**: install ttyd, run it, tunnel via cloudflared, embed in iframe. Would give native terminal quality but adds complexity and another tunnel hop.
-
-### Current status
-Login works end-to-end but UX is rough (minutes of blank screen, laggy input). The terminal is only needed for one-time login — after that the chat UI is smooth. Question is whether the one-time pain is acceptable or if we need a better container runtime.
+### For the Product (onboarding flow)
+- User needs to provide their Claude OAuth token to OpenClaw
+- Simplest: landing page with instructions to run `claude setup-token` in their terminal
+- Better: iframe or popup that walks them through the OAuth flow and captures the token
+- The token gets injected into OpenClaw via the secure entrypoint (env var, not on disk)
+- OpenClaw stores it in its own encrypted credential store
+- With our security hardening, the token is in process memory only — not readable from disk or /proc
 
 ---
 
