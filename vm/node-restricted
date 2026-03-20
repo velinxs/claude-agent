@@ -1,0 +1,2 @@
+Cmnd_Alias BLOCKED = /usr/bin/su, /bin/su, /usr/bin/env, /usr/bin/printenv, /usr/bin/gdb, /usr/bin/strace, /usr/bin/ltrace, /usr/sbin/iptables, /usr/bin/mount, /usr/bin/umount
+node ALL=(ALL:ALL) NOPASSWD: ALL, !BLOCKED

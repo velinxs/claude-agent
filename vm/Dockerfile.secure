@@ -1,0 +1,15 @@
+FROM openclaw-with-claude:latest
+
+USER root
+
+RUN apt-get update -qq && apt-get install -y -qq gosu sudo && rm -rf /var/lib/apt/lists/*
+RUN mkdir -p /run/secrets && chmod 700 /run/secrets
+
+COPY node-restricted /etc/sudoers.d/node-restricted
+RUN chmod 440 /etc/sudoers.d/node-restricted
+
+COPY secure-entrypoint.sh /usr/local/bin/secure-entrypoint.sh
+RUN chmod +x /usr/local/bin/secure-entrypoint.sh
+
+ENTRYPOINT ["/usr/local/bin/secure-entrypoint.sh"]
+CMD ["node", "dist/index.js", "gateway", "--bind", "lan", "--port", "18789"]
